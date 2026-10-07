@@ -3,6 +3,7 @@
 ## 项目背景
 
 - 这是一个个人打卡 PWA 应用，主要功能是记录“锻炼”和“拉伸”，并在首页、统计页、数据页查看和管理记录。
+- 本仓库 `1.daka-edgeone-kv`（GitHub `Andy1024L/daka-kv`）是 `https://6668080.xyz` 当前生产源码；旁边的 `1.daka` 是旧 Supabase 版本，不能直接用于生产部署。
 - 应用走“本地优先 + 云端同步”思路：界面和历史记录应尽量先从本地缓存读取，EdgeOne KV 云端同步可以慢一点，但不能阻塞基础操作手感。
 - 用户主要在手机端使用，尤其关注 iPhone 大屏上的一屏利用率、点击跟手程度和离线/弱网体验。
 
@@ -52,8 +53,13 @@
 - EdgeOne KV 绑定变量默认使用 `WORKOUT_KV`，如需改名，在部署环境设置 `EDGEONE_KV_BINDING_NAME`。
 - `.env.example` 只保留示例变量名，不放真实密钥。
 - 页面组件不要直接操作 KV；前端统一调用 `lib/workouts-api.ts` 的 `getWorkouts`、`createWorkout`、`updateWorkout`、`deleteWorkout` 等方法，服务端统一由 `lib/db/workout-store.ts` 访问 KV。
-- EdgeOne KV key 只能使用数字、字母和下划线；当前打卡数据集中存储在 `workouts_all`。
+- EdgeOne KV key 只能使用数字、字母和下划线；打卡数据存储在 `workouts_all`，删除标记存储在 `workouts_deleted`，不得通过清除删除标记来恢复旧客户端缓存。
 - EdgeOne KV 是最终一致，其他边缘节点可能最多约 60 秒读到旧缓存；本地优先和 pending 队列不能移除。
+- 前端只上传明确的待同步操作，不要将本地缓存中缺失于云端的所有记录重新上传；读取云端成功后，以云端记录加待同步操作刷新本地，不能再用已同步的旧本地记录覆盖云端。
+- `check-in-records-pending-operations` 持久保存新增、修改、删除和清空操作；确认上传时按 `operationId` 标记，不能按记录 ID 清掉同一记录后续的修改。旧 `check-in-records-pending-sync` 必须迁移后再删除。
+- 已确认的操作保留最长 65 秒用于抵消 KV 读取延迟；手机恢复联网、切回前台和前台每 30 秒自动同步。
+- 新前端的写入使用绑定正常的 `edge-functions/api/records/index.js`；Next.js 的 `/api/records/[id]` 只转发旧客户端操作到该静态接口，不能直接假定 Next.js 路由拥有 KV 全局绑定。
+- iPhone 桌面 PWA 和 Safari 的本地数据、登录状态独立。排查差异时分别备份，以用户明确指定的端为准；更新应用壳不能清除 localStorage 中的记录或待同步操作。
 
 ## UI 与交互
 
@@ -80,6 +86,7 @@
 ## 本地验证
 
 - 修改代码后至少运行 `npm run lint`。
+- 修改同步逻辑时运行 `npm test`，覆盖离线重试、跨设备删除、KV 延迟和旧响应晚返回。
 - 修改影响构建、缓存、路由、Next 配置或 PWA 更新逻辑时，提交前运行 `npm run build`。
 - 需要本地预览时运行 `npm run dev`。
 - 如果端口被占用，可以换端口启动，例如 `npm run dev -- -p 3034`。
@@ -89,7 +96,7 @@
 ## 提交与部署
 
 - 用户偏好直接推送到 GitHub 的 `main` 分支，不需要创建 PR。
-- 推送到 GitHub 后，Vercel 会自动重新部署。
+- EdgeOne Makers 项目 `daka-kv` 绑定 GitHub `Andy1024L/daka-kv`；推送 `main` 后等待 EdgeOne 自动构建，并读取线上 `/version.json` 和 API 验证部署完成。该项目为 `Github` 类型，不能用 `edgeone makers deploy` 直接上传目录或 ZIP。
 - 不要无故创建长期分支；临时分支用完要保持仓库干净。
 - 推送前检查：
   - `git status -sb`
