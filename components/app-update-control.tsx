@@ -100,11 +100,14 @@ export function AppUpdateControl() {
     try {
       const response = await fetch(`/version.json?t=${Date.now()}`, {
         cache: "no-store",
+        signal: AbortSignal.timeout(15_000),
       })
+      if (!response.ok) throw new Error("更新信息读取失败")
       const latest = (await response.json()) as VersionInfo
+      if (!latest.version) throw new Error("更新信息格式异常")
       setLatestUpdatedAt(latest.updatedAt ?? null)
 
-      if (!latest.version || latest.version === APP_VERSION) {
+      if (latest.version === APP_VERSION) {
         setState("current")
         return
       }

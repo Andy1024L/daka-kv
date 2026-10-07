@@ -3,6 +3,13 @@ import type { CheckInRecord } from "@/types"
 const STORAGE_KEY = "check-in-records"
 const LEGACY_CACHE_KEY = "check-in-records-cache"
 const PENDING_SYNC_KEY = "check-in-records-pending-sync"
+const PENDING_OPERATIONS_KEY = "check-in-records-pending-operations"
+const SYNC_BACKUP_KEY = "check-in-records-before-sync-v2"
+
+export type WorkoutOperation = {
+  operationId: string
+  syncedAt?: number
+} & ({ kind: "save"; record: CheckInRecord } | { kind: "delete"; id: string } | { kind: "clear" })
 
 let xlsxModule: typeof import("@e965/xlsx") | null = null
 let memoryCache: CheckInRecord[] | null = null
@@ -209,6 +216,92 @@ export function getRecords(): CheckInRecord[] {
 export function saveRecords(records: CheckInRecord[]): boolean {
   if (typeof window === "undefined") return false
   return persistRecords(records)
+}
+
+export function reloadStoredRecords(): CheckInRecord[] {
+  memoryCache = null
+  return getRecords()
+}
+
+export function backupRecordsBeforeSync(): void {
+  if (getItem(SYNC_BACKUP_KEY) === null) setItem(SYNC_BACKUP_KEY, JSON.stringify(getRecords()))
+}
+
+function saveWorkoutOperations(operations: WorkoutOperation[]): boolean {
+  return setItem(PENDING_OPERATIONS_KEY, JSON.stringify(operations))
+}
+
+export function getWorkoutOperations(): WorkoutOperation[] {
+  let operations: WorkoutOperation[] = []
+  try {
+    const parsed = JSON.parse(getItem(PENDING_OPERATIONS_KEY) ?? "[]")
+    if (Array.isArray(parsed)) {
+      operations = parsed.flatMap((value): WorkoutOperation[] => {
+        if (!value || typeof value.operationId !== "string") return []
+        const base = { operationId: value.operationId, syncedAt: typeof value.syncedAt === "number" ? value.syncedAt : undefined }
+        if (value.kind === "clear") return [{ ...base, kind: "clear" }]
+        if (value.kind === "delete" && typeof value.id === "string") return [{ ...base, kind: "delete", id: value.id }]
+        const record = value.kind === "save" ? normalizeRecord(value.record) : null
+        return record ? [{ ...base, kind: "save", record }] : []
+      })
+    }
+  } catch {
+    // Keep the existing records available if the queue is unreadable.
+  }
+
+  const legacyPending = getPendingSyncRecords()
+  if (legacyPending.length > 0) {
+    for (const record of legacyPending) {
+      if (!operations.some((operation) => operation.kind === "clear" || (operation.kind === "save" ? operation.record.id === record.id : operation.id === record.id))) {
+        operations.push({ operationId: crypto.randomUUID(), kind: "save", record })
+      }
+    }
+    if (saveWorkoutOperations(operations)) savePendingSyncRecords([])
+  }
+  return operations
+}
+
+export function queueWorkoutOperation(operation: WorkoutOperation): void {
+  const current = getWorkoutOperations()
+  const id = operation.kind === "save" ? operation.record.id : operation.kind === "delete" ? operation.id : null
+  const next = operation.kind === "clear" ? [] : current.filter((item) =>
+    item.kind === "clear" || (item.kind === "save" ? item.record.id : item.id) !== id
+  )
+  if (!saveWorkoutOperations([...next, operation])) throw new Error("本机保存失败，请检查剩余空间")
+}
+
+export function markWorkoutOperationSynced(operationId: string): void {
+  saveWorkoutOperations(getWorkoutOperations().map((operation) =>
+    operation.operationId === operationId ? { ...operation, syncedAt: Date.now() } : operation
+  ))
+}
+
+export function discardDeletedWorkoutOperations(ids: string[]): void {
+  const deleted = new Set(ids)
+  saveWorkoutOperations(getWorkoutOperations().filter((operation) =>
+    operation.kind === "clear" || !deleted.has(operation.kind === "save" ? operation.record.id : operation.id)
+  ))
+}
+
+export function reconcileWorkoutOperations(cloudRecords: CheckInRecord[]): WorkoutOperation[] {
+  // Keep a short overlay while KV reads catch up with acknowledged writes.
+  const active = getWorkoutOperations().filter((operation) => !operation.syncedAt || Date.now() - operation.syncedAt <= 65_000)
+  const cloud = mergeRecordLists(cloudRecords)
+  const reflected = JSON.stringify(applyWorkoutOperations(cloud, active)) === JSON.stringify(cloud)
+  // Reconcile the complete sequence: a clear followed by a save must stay together.
+  const operations = reflected ? active.filter((operation) => !operation.syncedAt) : active
+  saveWorkoutOperations(operations)
+  return operations
+}
+
+export function applyWorkoutOperations(records: CheckInRecord[], operations = getWorkoutOperations()): CheckInRecord[] {
+  let next = records
+  for (const operation of operations) {
+    if (operation.kind === "clear") next = []
+    else if (operation.kind === "delete") next = next.filter((record) => record.id !== operation.id)
+    else next = mergeRecordLists(next, [operation.record])
+  }
+  return next
 }
 
 export function getPendingSyncRecords(): CheckInRecord[] {

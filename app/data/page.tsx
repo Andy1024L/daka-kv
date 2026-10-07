@@ -41,7 +41,8 @@ export default function DataPage({
 
   const refreshRecords = useCallback(async () => {
     try {
-      const data = await getWorkouts()
+      await getWorkouts()
+      const data = getRecords()
       setRecords(data)
       onRecordsChange?.(data)
       setError(null)
@@ -111,12 +112,14 @@ export default function DataPage({
       await refreshRecords()
       showToast("数据已清除")
     } catch {
-      showToast("清除失败，请重试")
+      const localRecords = getRecords()
+      setRecords(localRecords)
+      onRecordsChange?.(localRecords)
+      showToast("已在本机清除，联网后会自动同步")
     }
   }
 
   const handleDeleteRecord = (id: string) => {
-    const previousRecords = records
     const nextRecords = records.filter((record) => record.id !== id)
     setRecords(nextRecords)
     onRecordsChange?.(nextRecords)
@@ -124,9 +127,9 @@ export default function DataPage({
     deleteWorkout(id)
       .then(() => showToast("记录已删除"))
       .catch(() => {
-        setRecords(previousRecords)
-        onRecordsChange?.(previousRecords)
-        showToast("删除失败，请重试")
+        setRecords(getRecords())
+        onRecordsChange?.(getRecords())
+        showToast("已在本机删除，联网后会自动同步")
       })
   }
 
@@ -145,7 +148,6 @@ export default function DataPage({
       return
     }
 
-    const previousRecords = records
     const nextRecords = records.map((record) =>
       record.id === editingRecord.id ? { ...record, date: editDate, duration } : record
     )
@@ -155,9 +157,9 @@ export default function DataPage({
     showToast("记录已更新")
 
     updateWorkout(editingRecord.id, { date: editDate, duration }).catch(() => {
-      setRecords(previousRecords)
-      onRecordsChange?.(previousRecords)
-      showToast("更新失败，请重试")
+      setRecords(getRecords())
+      onRecordsChange?.(getRecords())
+      showToast("已保存到本机，联网后会自动同步")
     })
   }
 

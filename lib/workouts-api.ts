@@ -1,34 +1,43 @@
 import type { AppConfig, CheckInRecord } from "@/types"
 import {
+  applyWorkoutOperations,
+  backupRecordsBeforeSync,
+  discardDeletedWorkoutOperations,
   formatLocalDate,
-  getPendingSyncRecords,
   getRecords,
+  getWorkoutOperations,
+  markWorkoutOperationSynced,
   mergeRecordLists,
-  queuePendingSyncRecord,
-  removePendingSyncRecords,
-  savePendingSyncRecords,
+  queueWorkoutOperation,
+  reconcileWorkoutOperations,
   saveRecords,
 } from "@/lib/storage"
 
-function mergeRecords(records: CheckInRecord[], nextRecord: CheckInRecord): CheckInRecord[] {
-  const nextRecords = records.filter((record) => record.id !== nextRecord.id)
-  return [nextRecord, ...nextRecords]
+export const WORKOUTS_CHANGED_EVENT = "workouts-changed"
+let syncPromise: Promise<CheckInRecord[]> | null = null
+let loadPromise: Promise<CheckInRecord[]> | null = null
+
+function persistAndNotify(records: CheckInRecord[]) {
+  if (!saveRecords(records)) throw new Error("本机保存失败，请检查剩余空间")
+  window.dispatchEvent(new Event(WORKOUTS_CHANGED_EVENT))
 }
 
 async function requestJson<T>(url: string, init?: RequestInit): Promise<T> {
   const response = await fetch(url, {
     ...init,
-    headers: {
-      "Content-Type": "application/json",
-      ...init?.headers,
-    },
+    cache: "no-store",
+    credentials: "same-origin",
+    signal: AbortSignal.timeout(20_000),
+    headers: { "Content-Type": "application/json", ...init?.headers },
   })
-  const data = await response.json().catch(() => ({}))
-
-  if (!response.ok) {
-    throw new Error(typeof data.error === "string" ? data.error : "请求失败")
+  if (response.status === 401 || (response.redirected && new URL(response.url).pathname === "/login")) {
+    const next = `${window.location.pathname}${window.location.search}`
+    window.location.replace(`/login?next=${encodeURIComponent(next)}`)
+    throw new Error("需要重新登录，本机记录已保留")
   }
-
+  if (!response.headers.get("content-type")?.includes("application/json")) throw new Error("云端响应异常，请稍后重试")
+  const data = await response.json()
+  if (!response.ok) throw new Error(typeof data.error === "string" ? data.error : "同步失败")
   return data as T
 }
 
@@ -36,135 +45,92 @@ export async function getAppConfig(): Promise<AppConfig> {
   return requestJson<AppConfig>("/api/config")
 }
 
-export async function syncPendingWorkouts(): Promise<CheckInRecord[]> {
-  const pendingRecords = getPendingSyncRecords()
-  if (pendingRecords.length === 0) return []
-
-  const data = await requestJson<{ records: CheckInRecord[] }>("/api/records", {
-    method: "POST",
-    body: JSON.stringify({ records: pendingRecords }),
-  })
-
-  const savedRecords = data.records.length > 0 ? data.records : pendingRecords
-  removePendingSyncRecords(savedRecords.map((record) => record.id))
-  saveRecords(mergeRecordLists(getRecords(), savedRecords))
-
-  return savedRecords
+export function syncPendingWorkouts(): Promise<CheckInRecord[]> {
+  if (syncPromise) return syncPromise
+  syncPromise = (async () => {
+    const attempted = new Set<string>()
+    while (true) {
+      const operation = getWorkoutOperations().find((item) => !item.syncedAt && !attempted.has(item.operationId))
+      if (!operation) break
+      attempted.add(operation.operationId)
+      if (operation.kind === "save") {
+        const data = await requestJson<{ records: CheckInRecord[] }>("/api/records", { method: "POST", body: JSON.stringify(operation.record) })
+        if (!data.records?.some((record) => record.id === operation.record.id)) throw new Error("云端未确认保存，请稍后重试")
+      } else {
+        const data = await requestJson<{ ok: boolean }>("/api/records", {
+          method: "DELETE",
+          body: JSON.stringify(operation.kind === "delete" ? { id: operation.id } : { clear: true }),
+        })
+        if (!data.ok) throw new Error("云端未确认删除，请稍后重试")
+      }
+      // Match the operation token so an older response cannot erase a newer edit.
+      markWorkoutOperationSynced(operation.operationId)
+      persistAndNotify(applyWorkoutOperations(getRecords()))
+    }
+    return getRecords()
+  })().finally(() => { syncPromise = null })
+  return syncPromise
 }
 
-export async function getWorkouts(): Promise<CheckInRecord[]> {
-  await syncPendingWorkouts().catch(() => undefined)
-
-  const data = await requestJson<{ records: CheckInRecord[] }>("/api/records")
-  const localRecords = getRecords()
-  const pendingRecords = getPendingSyncRecords()
-  const remoteRecordIds = new Set(data.records.map((record) => record.id))
-  const localOnlyRecords = mergeRecordLists(localRecords, pendingRecords).filter((record) => !remoteRecordIds.has(record.id))
-  let savedLocalRecords: CheckInRecord[] = []
-
-  if (localOnlyRecords.length > 0) {
-    const syncedData = await requestJson<{ records: CheckInRecord[] }>("/api/records", {
-      method: "POST",
-      body: JSON.stringify({ records: localOnlyRecords }),
-    }).catch(() => {
-      savePendingSyncRecords(mergeRecordLists(pendingRecords, localOnlyRecords))
-      return { records: [] }
-    })
-
-    savedLocalRecords = syncedData.records.length > 0 ? syncedData.records : []
-    removePendingSyncRecords(savedLocalRecords.map((record) => record.id))
-  }
-
-  const records = mergeRecordLists(data.records, localRecords, pendingRecords, savedLocalRecords)
-  saveRecords(records)
-  return records
+export function getWorkouts(): Promise<CheckInRecord[]> {
+  if (loadPromise) return loadPromise
+  loadPromise = (async () => {
+    backupRecordsBeforeSync()
+    await syncPendingWorkouts().catch(() => undefined)
+    const data = await requestJson<{ records: CheckInRecord[]; deletedIds?: string[] }>("/api/records")
+    if (!Array.isArray(data.records)) throw new Error("云端记录格式异常，请稍后重试")
+    if (Array.isArray(data.deletedIds)) discardDeletedWorkoutOperations(data.deletedIds)
+    const records = applyWorkoutOperations(data.records, reconcileWorkoutOperations(data.records))
+    persistAndNotify(records)
+    return records
+  })().finally(() => { loadPromise = null })
+  return loadPromise
 }
 
 export function createOptimisticWorkout(category: CheckInRecord["category"], duration: number): CheckInRecord {
   const now = new Date()
   const date = formatLocalDate(now)
-
-  return {
-    id: `${date.replace(/-/g, "")}-${crypto.randomUUID()}`,
-    timestamp: now.getTime(),
-    date,
-    category,
-    duration,
-  }
+  return { id: `${date.replace(/-/g, "")}-${crypto.randomUUID()}`, timestamp: now.getTime(), date, category, duration }
 }
 
 export async function createWorkout(record: CheckInRecord): Promise<CheckInRecord> {
-  saveRecords(mergeRecords(getRecords(), record))
-  queuePendingSyncRecord(record)
-
-  const data = await requestJson<{ records: CheckInRecord[] }>("/api/records", {
-    method: "POST",
-    body: JSON.stringify(record),
-  })
-
-  const savedRecord = data.records.find((item) => item.id === record.id) ?? data.records[0] ?? record
-  removePendingSyncRecords([savedRecord.id])
-  saveRecords(mergeRecords(getRecords(), savedRecord))
-  return savedRecord
+  queueWorkoutOperation({ operationId: crypto.randomUUID(), kind: "save", record })
+  persistAndNotify(mergeRecordLists(getRecords(), [record]))
+  await syncPendingWorkouts()
+  return getRecords().find((item) => item.id === record.id) ?? record
 }
 
 export async function importWorkouts(records: CheckInRecord[]): Promise<CheckInRecord[]> {
-  saveRecords(records)
-
-  const data = await requestJson<{ records: CheckInRecord[] }>("/api/records", {
-    method: "POST",
-    body: JSON.stringify({ records }),
-  })
-
-  saveRecords(data.records)
-  return data.records
+  const current = new Map(getRecords().map((record) => [record.id, record]))
+  for (const record of records) {
+    const previous = current.get(record.id)
+    if (!previous || previous.date !== record.date || previous.duration !== record.duration || previous.timestamp !== record.timestamp || previous.category !== record.category) {
+      queueWorkoutOperation({ operationId: crypto.randomUUID(), kind: "save", record })
+    }
+  }
+  persistAndNotify(mergeRecordLists(getRecords(), records))
+  await syncPendingWorkouts()
+  return getWorkouts()
 }
 
-export async function updateWorkout(
-  id: string,
-  updates: Partial<Pick<CheckInRecord, "date" | "duration">>
-): Promise<CheckInRecord> {
-  const previousRecords = getRecords()
-  const optimisticRecords = previousRecords.map((record) =>
-    record.id === id
-      ? {
-          ...record,
-          date: updates.date ?? record.date,
-          duration: updates.duration ?? record.duration,
-        }
-      : record
-  )
-  saveRecords(optimisticRecords)
-
-  const data = await requestJson<{ record: CheckInRecord }>(`/api/records/${encodeURIComponent(id)}`, {
-    method: "PATCH",
-    body: JSON.stringify(updates),
-  })
-
-  saveRecords(mergeRecords(getRecords(), data.record))
-  return data.record
+export async function updateWorkout(id: string, updates: Partial<Pick<CheckInRecord, "date" | "duration">>): Promise<CheckInRecord> {
+  const previous = getRecords().find((record) => record.id === id)
+  if (!previous) throw new Error("记录不存在")
+  const record = { ...previous, ...updates }
+  queueWorkoutOperation({ operationId: crypto.randomUUID(), kind: "save", record })
+  persistAndNotify(mergeRecordLists(getRecords(), [record]))
+  await syncPendingWorkouts()
+  return record
 }
 
 export async function deleteWorkout(id: string): Promise<void> {
-  const previousRecords = getRecords()
-  saveRecords(previousRecords.filter((record) => record.id !== id))
-
-  await requestJson(`/api/records/${encodeURIComponent(id)}`, {
-    method: "DELETE",
-  }).catch((error) => {
-    saveRecords(previousRecords)
-    throw error
-  })
+  queueWorkoutOperation({ operationId: crypto.randomUUID(), kind: "delete", id })
+  persistAndNotify(getRecords().filter((record) => record.id !== id))
+  await syncPendingWorkouts()
 }
 
 export async function clearWorkouts(): Promise<void> {
-  const previousRecords = getRecords()
-  saveRecords([])
-
-  await requestJson("/api/records", {
-    method: "DELETE",
-  }).catch((error) => {
-    saveRecords(previousRecords)
-    throw error
-  })
+  queueWorkoutOperation({ operationId: crypto.randomUUID(), kind: "clear" })
+  persistAndNotify([])
+  await syncPendingWorkouts()
 }

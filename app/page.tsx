@@ -8,8 +8,8 @@ import { type AppTab, AppTabProvider } from "@/components/app-tab-context"
 import { AppUpdateControl } from "@/components/app-update-control"
 import { BottomNav } from "@/components/bottom-nav"
 import { SuccessToast } from "@/components/success-toast"
-import { createOptimisticWorkout, createWorkout, getWorkouts } from "@/lib/workouts-api"
-import { formatLocalDate, getDailyStats, getRecords, mergeRecordLists } from "@/lib/storage"
+import { createOptimisticWorkout, createWorkout, getWorkouts, WORKOUTS_CHANGED_EVENT } from "@/lib/workouts-api"
+import { formatLocalDate, getDailyStats, getRecords, getWorkoutOperations, mergeRecordLists, reloadStoredRecords } from "@/lib/storage"
 import type { CheckInRecord } from "@/types"
 
 const weekDayLabels = ["一", "二", "三", "四", "五", "六", "日"]
@@ -93,7 +93,7 @@ function RecentWeeks({ records, kind }: { records: CheckInRecord[]; kind: "worko
   )
 }
 
-function HomeView({ records, onRecordCreated }: { records: CheckInRecord[]; onRecordCreated: (record: CheckInRecord) => void }) {
+function HomeView({ records, onRecordCreated, syncMessage }: { records: CheckInRecord[]; onRecordCreated: (record: CheckInRecord) => void; syncMessage: string | null }) {
   const [toast, setToast] = useState({ visible: false, message: "" })
   const [animatingButton, setAnimatingButton] = useState<string | null>(null)
 
@@ -220,6 +220,7 @@ function HomeView({ records, onRecordCreated }: { records: CheckInRecord[]; onRe
         </section>
 
         <div>
+          {syncMessage && <p role="status" className="text-center text-[11px] text-muted-foreground">{syncMessage}</p>}
           <AppUpdateControl />
         </div>
       </div>
@@ -234,6 +235,7 @@ export default function HomePage() {
   const [isAuthenticated, setIsAuthenticated] = useState(false)
   const [activeTab, setActiveTab] = useState<AppTab>("home")
   const [records, setRecords] = useState<CheckInRecord[]>(() => getRecords())
+  const [syncMessage, setSyncMessage] = useState<string | null>(null)
 
   useEffect(() => {
     fetch("/api/auth/session", { cache: "no-store" })
@@ -244,7 +246,10 @@ export default function HomePage() {
         }
         setIsAuthenticated(true)
       })
-      .catch(() => window.location.replace("/login?next=/"))
+      .catch(() => {
+        if (getRecords().length > 0) setIsAuthenticated(true)
+        else window.location.replace("/login?next=/")
+      })
   }, [])
 
   useEffect(() => {
@@ -252,16 +257,42 @@ export default function HomePage() {
 
     let isMounted = true
 
-    getWorkouts()
-      .then((data) => {
-        if (isMounted) setRecords((current) => mergeRecordLists(data, current))
-      })
-      .catch(() => {
-        if (isMounted) setRecords((current) => (current.length > 0 ? current : getRecords()))
-      })
+    const updateLocal = () => {
+      if (isMounted) setRecords(getRecords())
+    }
+    const refresh = () => {
+      if (document.visibilityState === "hidden") return
+      getWorkouts()
+        .then(() => {
+          if (!isMounted) return
+          setRecords(getRecords())
+          setSyncMessage(getWorkoutOperations().some((operation) => !operation.syncedAt) ? "有修改待同步，联网后会自动重试" : null)
+        })
+        .catch(() => {
+          if (!isMounted) return
+          setRecords(getRecords())
+          setSyncMessage("同步暂未完成，本机数据已保留")
+        })
+    }
+    const onStorage = (event: StorageEvent) => {
+      if (event.key?.startsWith("check-in-records")) setRecords(reloadStoredRecords())
+    }
+    refresh()
+    window.addEventListener(WORKOUTS_CHANGED_EVENT, updateLocal)
+    window.addEventListener("online", refresh)
+    window.addEventListener("focus", refresh)
+    window.addEventListener("storage", onStorage)
+    document.addEventListener("visibilitychange", refresh)
+    const timer = window.setInterval(refresh, 30_000)
 
     return () => {
       isMounted = false
+      window.removeEventListener(WORKOUTS_CHANGED_EVENT, updateLocal)
+      window.removeEventListener("online", refresh)
+      window.removeEventListener("focus", refresh)
+      window.removeEventListener("storage", onStorage)
+      document.removeEventListener("visibilitychange", refresh)
+      window.clearInterval(timer)
     }
   }, [isAuthenticated])
 
@@ -274,7 +305,7 @@ export default function HomePage() {
   return (
     <AppTabProvider value={{ activeTab, setActiveTab }}>
       {activeTab === "home" ? (
-        <HomeView records={records} onRecordCreated={handleRecordCreated} />
+        <HomeView records={records} onRecordCreated={handleRecordCreated} syncMessage={syncMessage} />
       ) : activeTab === "stats" ? (
         <StatsPage records={records} />
       ) : (

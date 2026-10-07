@@ -1,4 +1,4 @@
-const CACHE_VERSION = "daka-shell-v20260621-force-refresh-v3"
+const CACHE_VERSION = "daka-shell-v20261007-record-sync-v2"
 
 async function deleteOldCaches() {
   const cacheNames = await caches.keys()
@@ -6,7 +6,7 @@ async function deleteOldCaches() {
 }
 
 self.addEventListener("install", (event) => {
-  event.waitUntil(Promise.resolve())
+  event.waitUntil(self.skipWaiting())
 })
 
 self.addEventListener("activate", (event) => {
