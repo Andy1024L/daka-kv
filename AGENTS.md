@@ -97,6 +97,7 @@
 
 - 用户偏好直接推送到 GitHub 的 `main` 分支，不需要创建 PR。
 - EdgeOne Makers 项目 `daka-kv` 绑定 GitHub `Andy1024L/daka-kv`；推送 `main` 后等待 EdgeOne 自动构建，并读取线上 `/version.json` 和 API 验证部署完成。该项目为 `Github` 类型，不能用 `edgeone makers deploy` 直接上传目录或 ZIP。
+- `6668080.xyz` 的 HTTPS 使用 EdgeOne「申请免费证书 + 自动验证」，依赖 CNAME 持续正确指向 EdgeOne，由平台自动续签和部署。所有端同时同步失败时，先检查 TLS 证书有效期及浏览器 `ERR_CERT_DATE_INVALID`，不要清缓存、忽略证书错误或把各端缓存强行互相覆盖。
 - 不要无故创建长期分支；临时分支用完要保持仓库干净。
 - 推送前检查：
   - `git status -sb`
